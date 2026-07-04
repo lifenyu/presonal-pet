@@ -1,4 +1,7 @@
 import { execSync } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import {
   insertUsageRecord,
   finishUsageRecord,
@@ -7,112 +10,104 @@ import {
 import { getMainWindow } from './main';
 import { onUserStateChanged } from './reminder';
 
-// 当前正在记录的使用记录
 let currentRecordId: number | null = null;
 let currentAppName: string = '';
 let currentStartTime: Date | null = null;
 let monitorTimer: ReturnType<typeof setInterval> | null = null;
-
-// 空闲检测
-let lastInputTime: Date = new Date();
 let isIdle: boolean = false;
-const IDLE_THRESHOLD_SEC = 60; // 60 秒无操作视为空闲
-
-// 轮询间隔（毫秒）
+const IDLE_THRESHOLD_SEC = 60;
 const POLL_INTERVAL_MS = 5000;
 
-/**
- * 获取当前前台窗口的进程名和窗口标题
- * 使用 PowerShell 调用 Win32 API
- */
+// 写入临时 .ps1 文件避免 here-string 解析问题
+const PS_FOREGROUND = join(tmpdir(), 'pet-foreground.ps1');
+const PS_IDLE = join(tmpdir(), 'pet-idle.ps1');
+
+const foregroundScript = `Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+  public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}
+"@
+$hwnd = [WinAPI]::GetForegroundWindow()
+$sb = New-Object System.Text.StringBuilder 512
+[WinAPI]::GetWindowText($hwnd, $sb, 512) | Out-Null
+$title = $sb.ToString()
+$processId = 0
+[WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$processId) | Out-Null
+$proc = Get-Process -Id $processId -ErrorAction SilentlyContinue
+if ($proc) {
+  Write-Output "$($proc.ProcessName)|$title"
+}
+`;
+
+const idleScript = `Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public struct LASTINPUTINFO {
+  public uint cbSize;
+  public uint dwTime;
+}
+public class IdleDetector {
+  [DllImport("user32.dll")]
+  public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+  [DllImport("kernel32.dll")]
+  public static extern uint GetTickCount();
+}
+"@
+$lii = New-Object LASTINPUTINFO
+$lii.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lii)
+[IdleDetector]::GetLastInputInfo([ref]$lii) | Out-Null
+$tick = [IdleDetector]::GetTickCount()
+$idle = ($tick - $lii.dwTime) / 1000
+Write-Output $idle
+`;
+
+// 初始化时写入临时脚本文件
+function initScripts(): void {
+  writeFileSync(PS_FOREGROUND, foregroundScript, 'utf-8');
+  writeFileSync(PS_IDLE, idleScript, 'utf-8');
+}
+
+function cleanupScripts(): void {
+  try { unlinkSync(PS_FOREGROUND); } catch {}
+  try { unlinkSync(PS_IDLE); } catch {}
+}
+
 function getForegroundWindowInfo(): { appName: string; title: string } | null {
   try {
-    const psScript = `
-      Add-Type @"
-        using System;
-        using System.Runtime.InteropServices;
-        public class WinAPI {
-          [DllImport("user32.dll")]
-          public static extern IntPtr GetForegroundWindow();
-          [DllImport("user32.dll", SetLastError=true)]
-          public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
-          [DllImport("user32.dll")]
-          public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-        }
-"@
-      $hwnd = [WinAPI]::GetForegroundWindow()
-      $sb = New-Object System.Text.StringBuilder 256
-      [WinAPI]::GetWindowText($hwnd, $sb, 256) | Out-Null
-      $title = $sb.ToString()
-      $pid = 0
-      [WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
-      $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-      if ($proc) {
-        Write-Output "$($proc.ProcessName)|$title"
-      }
-    `.trim();
-
-    const result = execSync(`powershell -NoProfile -Command "${psScript.replace(/"/g, '\\"')}"`, {
-      encoding: 'utf-8',
-      timeout: 5000,
-      windowsHide: true,
-    }).trim();
-
+    const result = execSync(
+      `powershell -NoProfile -ExecutionPolicy Bypass -File "${PS_FOREGROUND}"`,
+      { encoding: 'utf-8', timeout: 8000, windowsHide: true }
+    ).trim();
     if (!result) return null;
-    const [appName, ...titleParts] = result.split('|');
+    const parts = result.split('|');
     return {
-      appName: appName?.trim() || 'unknown',
-      title: titleParts.join('|').trim() || '',
+      appName: parts[0]?.trim() || 'unknown',
+      title: parts.slice(1).join('|').trim() || '',
     };
   } catch {
     return null;
   }
 }
 
-/**
- * 获取用户空闲时间（秒）
- * 使用 Windows GetLastInputInfo
- */
 function getIdleTimeSeconds(): number {
   try {
-    const psScript = `
-      Add-Type @"
-        using System;
-        using System.Runtime.InteropServices;
-        public struct LASTINPUTINFO {
-          public uint cbSize;
-          public uint dwTime;
-        }
-        public class IdleDetector {
-          [DllImport("user32.dll")]
-          public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
-          [DllImport("kernel32.dll")]
-          public static extern uint GetTickCount();
-        }
-"@
-      $lii = New-Object LASTINPUTINFO
-      $lii.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lii)
-      [IdleDetector]::GetLastInputInfo([ref]$lii) | Out-Null
-      $tick = [IdleDetector]::GetTickCount()
-      $idle = ($tick - $lii.dwTime) / 1000
-      Write-Output $idle
-    `.trim();
-
-    const result = execSync(`powershell -NoProfile -Command "${psScript.replace(/"/g, '\\"')}"`, {
-      encoding: 'utf-8',
-      timeout: 5000,
-      windowsHide: true,
-    }).trim();
-
+    const result = execSync(
+      `powershell -NoProfile -ExecutionPolicy Bypass -File "${PS_IDLE}"`,
+      { encoding: 'utf-8', timeout: 5000, windowsHide: true }
+    ).trim();
     return parseFloat(result) || 0;
   } catch {
     return 0;
   }
 }
 
-/**
- * 结束当前记录
- */
 function finishCurrentRecord(): void {
   if (currentRecordId !== null && currentStartTime) {
     const now = new Date();
@@ -126,53 +121,6 @@ function finishCurrentRecord(): void {
   }
 }
 
-/**
- * 轮询前台窗口
- */
-function poll(): void {
-  // 空闲检测
-  const idleSec = getIdleTimeSeconds();
-  if (idleSec >= IDLE_THRESHOLD_SEC) {
-    if (!isIdle) {
-      isIdle = true;
-      finishCurrentRecord();
-      onUserStateChanged(false); // 通知提醒服务用户空闲
-      notifyRenderer('idle');
-    }
-    return;
-  }
-
-  // 用户活跃
-  if (isIdle) {
-    isIdle = false;
-    onUserStateChanged(true); // 通知提醒服务用户活跃
-    notifyRenderer('active');
-  }
-
-  const info = getForegroundWindowInfo();
-  if (!info) return;
-
-  const { appName, title } = info;
-
-  // 如果窗口没变化，不做任何事
-  if (appName === currentAppName) return;
-
-  // 窗口切换：结束旧记录，开始新记录
-  finishCurrentRecord();
-
-  const category = getCategoryForApp(appName);
-  const now = new Date();
-  currentRecordId = insertUsageRecord(appName, title, category, now.toISOString());
-  currentAppName = appName;
-  currentStartTime = now;
-
-  // 通知渲染进程当前应用变化
-  notifyRenderer('app-changed', { appName, title, category });
-}
-
-/**
- * 通知渲染进程
- */
 function notifyRenderer(event: string, data?: unknown): void {
   const win = getMainWindow();
   if (win && !win.isDestroyed()) {
@@ -180,32 +128,55 @@ function notifyRenderer(event: string, data?: unknown): void {
   }
 }
 
-/**
- * 启动监控
- */
+function poll(): void {
+  const idleSec = getIdleTimeSeconds();
+  if (idleSec >= IDLE_THRESHOLD_SEC) {
+    if (!isIdle) {
+      isIdle = true;
+      finishCurrentRecord();
+      onUserStateChanged(false);
+      notifyRenderer('idle');
+    }
+    return;
+  }
+
+  if (isIdle) {
+    isIdle = false;
+    onUserStateChanged(true);
+    notifyRenderer('active');
+  }
+
+  const info = getForegroundWindowInfo();
+  if (!info) return;
+  if (info.appName === currentAppName) return;
+
+  finishCurrentRecord();
+  const category = getCategoryForApp(info.appName);
+  const now = new Date();
+  currentRecordId = insertUsageRecord(info.appName, info.title, category, now.toISOString());
+  currentAppName = info.appName;
+  currentStartTime = now;
+  notifyRenderer('app-changed', { appName: info.appName, title: info.title, category });
+}
+
 export function startMonitor(): void {
   if (monitorTimer) return;
+  initScripts();
   console.log('Starting usage monitor...');
   monitorTimer = setInterval(poll, POLL_INTERVAL_MS);
-  // 立即执行一次
   poll();
 }
 
-/**
- * 停止监控
- */
 export function stopMonitor(): void {
   if (monitorTimer) {
     clearInterval(monitorTimer);
     monitorTimer = null;
   }
   finishCurrentRecord();
+  cleanupScripts();
   console.log('Usage monitor stopped.');
 }
 
-/**
- * 获取当前前台应用信息
- */
 export function getCurrentApp(): { appName: string; title: string; category: string; startTime: string | null } {
   return {
     appName: currentAppName,
